@@ -58,6 +58,10 @@ set(GLTF_SOURCES
     gltf/write.cpp
 )
 
+if(WIN32)
+    list(APPEND GLTF_SOURCES gltf/gltfpack.manifest)
+endif()
+
 if(MSVC)
     add_compile_options(/W4)
 else()
@@ -100,7 +104,7 @@ endif()
 set(TARGETS meshoptimizer)
 
 if(MESHOPT_BUILD_DEMO)
-    add_executable(demo demo/main.cpp demo/tests.cpp tools/objloader.cpp)
+    add_executable(demo demo/main.cpp demo/nanite.cpp demo/tests.cpp tools/objloader.cpp)
     target_link_libraries(demo meshoptimizer)
 endif()
 

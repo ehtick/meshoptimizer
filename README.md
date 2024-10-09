@@ -41,7 +41,8 @@ When optimizing a mesh, you should typically feed it through a set of optimizati
 4. Overdraw optimization
 5. Vertex fetch optimization
 6. Vertex quantization
-7. (optional) Vertex/index buffer compression
+7. Shadow indexing
+8. (optional) Vertex/index buffer compression
 
 ## Indexing
 
@@ -66,6 +67,8 @@ meshopt_remapVertexBuffer(vertices, &unindexed_vertices[0], unindexed_vertex_cou
 ```
 
 You can then further optimize the resulting buffers by calling the other functions on them in-place.
+
+`meshopt_generateVertexRemap` uses binary equivalence of vertex data, which is generally a reasonable default; however, in some cases some attributes may have floating point drift causing extra vertices to be generated. For such cases, it may be necessary to quantize some attributes (most importantly, normals and tangents) before generating the remap, or use a custom weld algorithm that supports per-attribute tolerance instead.
 
 ## Vertex cache optimization
 
@@ -123,6 +126,29 @@ unsigned short pz = meshopt_quantizeHalf(v.z);
 ```
 
 Since quantized vertex attributes often need to remain in their compact representations for efficient transfer and storage, they are usually dequantized during vertex processing by configuring the GPU vertex input correctly to expect normalized integers or half precision floats, which often needs no or minimal changes to the shader code. When CPU dequantization is required instead, `meshopt_dequantizeHalf` can be used to convert half precision values back to single precision; for normalized integer formats, the dequantization just requires dividing by 2^N-1 for unorm and 2^(N-1)-1 for snorm variants, for example manually reversing `meshopt_quantizeUnorm(v, 10)` can be done by dividing by 1023.
+
+## Shadow indexing
+
+Many rendering pipelines require meshes to be rendered to depth-only targets, such as shadow maps or during a depth pre-pass, in addition to color/G-buffer targets. While using the same geometry data for both cases is possible, reducing the number of unique vertices for depth-only rendering can be beneficial, especially when the source geometry has many attribute seams due to faceted shading or lightmap texture seams.
+To achieve this, this library provides the `meshopt_generateShadowIndexBuffer` algorithm, which generates a second (shadow) index buffer that can be used with the original vertex data:
+
+
+
+This is possible to achieve using `meshopt_generateShadowIndexBuffer` algorithm, which will generate a second (shadow) index buffer that can be used with the original vertex data. Because the vertex data is shared, this should be done after other optimizations of the vertex/index data, but it is possible (and recommended) to optimize the resulting index buffer for vertex cache at the end:
+
+```c++
+std::vector<unsigned int> shadow_indices(index_count);
+// note: this assumes Vertex starts with float3 positions and should be adjusted accordingly for quantized positions
+meshopt_generateShadowIndexBuffer(&shadow_indices[0], indices, index_count, &vertices[0].x, vertex_count, sizeof(float) * 3, sizeof(Vertex));
+```
+
+Because the vertex data is shared, shadow indexing should be done after other optimizations of the vertex/index data. However, it's possible (and recommended) to optimize the resulting shadow index buffer for vertex cache:
+
+```c++
+meshopt_optimizeVertexCache(&shadow_indices[0], &shadow_indices[0], index_count, vertex_count);
+```
+
+In some cases, it may be beneficial to split the vertex positions into a separate buffer to maximize efficiency for depth-only rendering. Note that the example above assumes only positions are relevant for shadow rendering, but more complex materials may require adding texture coordinates (for alpha testing) or skinning data to the vertex portion used as a key. `meshopt_generateShadowIndexBufferMulti` can be useful for these cases if the relevant data is not contiguous.
 
 ## Vertex/index buffer compression
 
@@ -233,7 +259,7 @@ std::vector<unsigned int> remap(index_count);
 size_t vertex_count = meshopt_generateVertexRemapMulti(&remap[0], NULL, index_count, index_count, streams, sizeof(streams) / sizeof(streams[0]));
 ```
 
-After this `meshopt_remapVertexBuffer` needs to be called once for each vertex stream to produce the correctly reindexed stream.
+After this `meshopt_remapVertexBuffer` needs to be called once for each vertex stream to produce the correctly reindexed stream. For shadow indexing, similarly `meshopt_generateShadowIndexBufferMulti` is available as a replacement.
 
 Instead of calling `meshopt_optimizeVertexFetch` for reordering vertices in a single vertex buffer for efficiency, calling `meshopt_optimizeVertexFetchRemap` and then calling `meshopt_remapVertexBuffer` for each stream again is recommended.
 
@@ -245,7 +271,7 @@ All algorithms presented so far don't affect visual appearance at all, with the 
 
 This library provides two simplification algorithms that reduce the number of triangles in the mesh. Given a vertex and an index buffer, they generate a second index buffer that uses existing vertices in the vertex buffer. This index buffer can be used directly for rendering with the original vertex buffer (preferably after vertex cache optimization), or a new compact vertex/index buffer can be generated using `meshopt_optimizeVertexFetch` that uses the optimal number and order of vertices.
 
-The first simplification algorithm, `meshopt_simplify`, follows the topology of the original mesh in an attempt to preserve attribute seams, borders and overall appearance. For meshes with inconsistent topology or many seams, such as faceted meshes, it can result in simplifier getting "stuck" and not being able to simplify the mesh fully. Therefore it's critical that identical vertices are "welded" together, that is, the input vertex buffer does not contain duplicates. Additionally, it may be possible to preprocess the index buffer (e.g. with `meshopt_generateShadowIndexBuffer`) to weld the vertices without taking into account vertex attributes that aren't critical and can be rebuilt later.
+The first simplification algorithm, `meshopt_simplify`, follows the topology of the original mesh in an attempt to preserve attribute seams, borders and overall appearance. For meshes with inconsistent topology or many seams, such as faceted meshes, it can result in simplifier getting "stuck" and not being able to simplify the mesh fully. Therefore it's critical that identical vertices are "welded" together, that is, the input vertex buffer does not contain duplicates. Additionally, it may be worthwhile to weld the vertices without taking into account vertex attributes that aren't critical and can be rebuilt later.
 
 ```c++
 float threshold = 0.2f;
@@ -259,6 +285,8 @@ lod.resize(meshopt_simplify(&lod[0], indices, index_count, &vertices[0].x, verte
 ```
 
 Target error is an approximate measure of the deviation from the original mesh using distance normalized to `[0..1]` range (e.g. `1e-2f` means that simplifier will try to maintain the error to be below 1% of the mesh extents). Note that the simplifier attempts to produce the requested number of indices at minimal error, but because of topological restrictions and error limit it is not guaranteed to reach the target index count and can stop earlier.
+
+To disable the error limit, `target_error` can be set to `FLT_MAX`. This makes it more likely that the simplifier will reach the target index count, but it may produce a mesh that looks significantly different from the original, so using the resulting error to control viewing distance would be required. Conversely, setting `target_index_count` to 0 will simplify the input mesh as much as possible within the specified error limit; this can be useful for generating LODs that should look good at a given viewing distance.
 
 The second simplification algorithm, `meshopt_simplifySloppy`, doesn't follow the topology of the original mesh. This means that it doesn't preserve attribute seams or borders, but it can collapse internal details that are too small to matter better because it can merge mesh features that are topologically disjoint but spatially close.
 
@@ -275,9 +303,15 @@ lod.resize(meshopt_simplifySloppy(&lod[0], indices, index_count, &vertices[0].x,
 
 This algorithm will not stop early due to topology restrictions but can still do so if target index count can't be reached without introducing an error larger than target. It is 5-6x faster than `meshopt_simplify` when simplification ratio is large, and is able to reach ~20M triangles/sec on a desktop CPU (`meshopt_simplify` works at ~3M triangles/sec).
 
-When a sequence of LOD meshes is generated that all use the original vertex buffer, care must be taken to order vertices optimally to not penalize mobile GPU architectures that are only capable of transforming a sequential vertex buffer range. It's recommended in this case to first optimize each LOD for vertex cache, then assemble all LODs in one large index buffer starting from the coarsest LOD (the one with fewest triangles), and call `meshopt_optimizeVertexFetch` on the final large index buffer. This will make sure that coarser LODs require a smaller vertex range and are efficient wrt vertex fetch and transform.
+Both algorithms can also return the resulting normalized deviation that can be used to choose the correct level of detail based on screen size or solid angle; the error can be converted to object space by multiplying by the scaling factor returned by `meshopt_simplifyScale`. For example, given a mesh with a precomputed LOD and a prescaled error, the screen-space normalized error can be computed and used for LOD selection:
 
-Both algorithms can also return the resulting normalized deviation that can be used to choose the correct level of detail based on screen size or solid angle; the error can be converted to world space by multiplying by the scaling factor returned by `meshopt_simplifyScale`.
+```c++
+float d = max(0, distance(camera_position, mesh_center) - mesh_radius);
+float e = d * (tan(camera_fovy / 2) * 2 / 1000); // assume ~1000 px vertical resolution
+bool lod_ok = e * lod_factor >= lod_error; // lod_factor can be 1 or can be adjusted for more or less aggressive LOD selection
+```
+
+When a sequence of LOD meshes is generated that all use the original vertex buffer, care must be taken to order vertices optimally to not penalize mobile GPU architectures that are only capable of transforming a sequential vertex buffer range. It's recommended in this case to first optimize each LOD for vertex cache, then assemble all LODs in one large index buffer starting from the coarsest LOD (the one with fewest triangles), and call `meshopt_optimizeVertexFetch` on the final large index buffer. This will make sure that coarser LODs require a smaller vertex range and are efficient wrt vertex fetch and transform.
 
 ## Advanced simplification
 
@@ -288,6 +322,7 @@ For basic customization, a number of options can be passed via `options` bitmask
 - `meshopt_SimplifyLockBorder` restricts the simplifier from collapsing edges that are on the border of the mesh. This can be useful for simplifying mesh subsets independently, so that the LODs can be combined without introducing cracks.
 - `meshopt_SimplifyErrorAbsolute` changes the error metric from relative to absolute both for the input error limit as well as for the resulting error. This can be used instead of `meshopt_simplifyScale`.
 - `meshopt_SimplifySparse` improves simplification performance assuming input indices are a sparse subset of the mesh. This can be useful when simplifying small mesh subsets independently, and is intended to be used for meshlet simplification. For consistency, it is recommended to use absolute errors when sparse simplification is desired, as this flag changes the meaning of the relative errors.
+- `meshopt_SimplifyPrune` allows the simplifier to remove isolated components regardless of the topological restrictions inside the component. This is generally recommended for full-mesh simplification as it can improve quality and reduce triangle count; note that with this option, triangles connected to locked vertices may be removed as part of their component.
 
 While `meshopt_simplify` is aware of attribute discontinuities by default (and infers them through the supplied index buffer) and tries to preserve them, it can be useful to provide information about attribute values. This allows the simplifier to take attribute error into account which can improve shading (by using vertex normals), texture deformation (by using texture coordinates), and may be necessary to preserve vertex colors when textures are not used in the first place. This can be done by using a variant of the simplification function that takes attribute values and weight factors, `meshopt_simplifyWithAttributes`:
 
@@ -302,11 +337,26 @@ lod.resize(meshopt_simplifyWithAttributes(&lod[0], indices, index_count, &vertic
     target_index_count, target_error, /* options= */ 0, &lod_error));
 ```
 
-The attributes are passed as a separate buffer (in the example above it's a subset of the same vertex buffer) and should be stored as consecutive floats; attribute weights are used to control the importance of each attribute in the simplification process.
+The attributes are passed as a separate buffer (in the example above it's a subset of the same vertex buffer) and should be stored as consecutive floats; attribute weights are used to control the importance of each attribute in the simplification process. For normalized attributes like normals and vertex colors, a weight around 1.0 is usually appropriate; internally, a change of `1/weight` in attribute value over a distance `d` is approximately equivalent to a change of `d` in position. Using higher weights may be appropriate to preserve attribute quality at the cost of position quality. If the attribute has a different scale (e.g. unnormalized vertex colors in [0..255] range), the weight should be divided by the scaling factor (1/255 in this example).
+
+Both the target error and the resulting error combine positional error and attribute error, so the error can be used to control the LOD while taking attribute quality into account, assuming carefully chosen weights.
 
 When using `meshopt_simplifyWithAttributes`, it is also possible to lock certain vertices by providing a `vertex_lock` array that contains a boolean value for each vertex in the mesh. This can be useful to preserve certain vertices, such as the boundary of the mesh, with more control than `meshopt_SimplifyLockBorder` option provides.
 
 Simplification currently assumes that the input mesh is using the same material for all triangles. If the mesh uses multiple materials, it is possible to split the mesh into subsets based on the material and simplify each subset independently, using `meshopt_SimplifyLockBorder` or `vertex_lock` to preserve material boundaries; however, this limits the collapses and as a result may reduce the resulting quality. An alternative approach is to encode information about the material into the vertex buffer, ensuring that all three vertices referencing the same triangle have the same material ID; this may require duplicating vertices on the boundary between materials. After this, simplification can be performed as usual, and after simplification per-triangle material information can be computed from the vertex material IDs. There is no need to inform the simplifier of the value of the material ID: the implicit boundaries created by duplicating vertices with conflicting material IDs will be preserved automatically.
+
+## Point cloud simplification
+
+In addition to triangle mesh simplification, this library provides a function to simplify point clouds. The algorithm reduces the point cloud to a specified number of points while preserving the overall appearance, and can optionally take per-point colors into account:
+
+```c++
+const float color_weight = 1;
+std::vector<unsigned int> indices(target_count);
+indices.resize(meshopt_simplifyPoints(&indices[0], &points[0].x, points.size(), sizeof(Point),
+    &points[0].r, sizeof(Point), color_weight, target_count));
+```
+
+The resulting indices can be used to render the simplified point cloud; to reduce the memory footprint, the point cloud can be reindexed to create an array of points from the indices.
 
 ## Mesh shading
 
@@ -316,7 +366,7 @@ Using mesh shaders in context of traditional mesh rendering provides an opportun
 
 To use mesh shaders for conventional rendering efficiently, geometry needs to be converted into a series of meshlets; each meshlet represents a small subset of the original mesh and comes with a small set of vertices and a separate micro-index buffer that references vertices in the meshlet. This information can be directly fed to the rasterizer from the mesh shader. This library provides algorithms to create meshlet data for a mesh, and - assuming geometry is static - can compute bounding information that can be used to perform cluster culling, a technique that can reject a meshlet if it's invisible on screen.
 
-To generate meshlet data, this library provides two algorithms - `meshopt_buildMeshletsScan`, which creates the meshlet data using a vertex cache-optimized index buffer as a starting point by greedily aggregating consecutive triangles until they go over the meshlet limits, and `meshopt_buildMeshlets`, which doesn't depend on any other algorithms and tries to balance topological efficiency (by maximizing vertex reuse inside meshlets) with culling efficiency (by minimizing meshlet radius and triangle direction divergence). `meshopt_buildMeshlets` is recommended in cases when the resulting meshlet data will be used in cluster culling algorithms.
+To generate meshlet data, this library provides `meshopt_buildMeshlets` algorithm, which tries to balance topological efficiency (by maximizing vertex reuse inside meshlets) with culling efficiency (by minimizing meshlet radius and triangle direction divergence) and produces GPU-friendly data. As an alternative (that can be useful for load-time processing), `meshopt_buildMeshletsScan` can create the meshlet data using a vertex cache-optimized index buffer as a starting point by greedily aggregating consecutive triangles until they go over the meshlet limits. `meshopt_buildMeshlets` is recommended for offline data processing even if cone culling is not used.
 
 ```c++
 const size_t max_vertices = 64;
@@ -334,7 +384,7 @@ size_t meshlet_count = meshopt_buildMeshlets(meshlets.data(), meshlet_vertices.d
 
 To generate the meshlet data, `max_vertices` and `max_triangles` need to be set within limits supported by the hardware; for NVidia the values of 64 and 124 are recommended (`max_triangles` must be divisible by 4 so 124 is the value closest to official NVidia's recommended 126). `cone_weight` should be left as 0 if cluster cone culling is not used, and set to a value between 0 and 1 to balance cone culling efficiency with other forms of culling like frustum or occlusion culling.
 
-Each resulting meshlet refers to a portion of `meshlet_vertices` and `meshlet_triangles` arrays; this data can be uploaded to GPU and used directly after trimming:
+Each resulting meshlet refers to a portion of `meshlet_vertices` and `meshlet_triangles` arrays; the arrays are overallocated for the worst case so it's recommended to trim them before saving them as an asset / uploading them to the GPU:
 
 ```c++
 const meshopt_Meshlet& last = meshlets[meshlet_count - 1];
@@ -350,6 +400,30 @@ For optimal performance, it is recommended to further optimize each meshlet in i
 
 ```c++
 meshopt_optimizeMeshlet(&meshlet_vertices[m.vertex_offset], &meshlet_triangles[m.triangle_offset], m.triangle_count, m.vertex_count);
+```
+
+Different applications will choose different strategies for rendering meshlets; on a GPU capable of mesh shading, meshlets can be rendered directly; for example, a basic GLSL shader for `VK_EXT_mesh_shader` extension could look like this (parts omitted for brevity):
+
+```glsl
+layout(binding = 0) readonly buffer Meshlets { Meshlet meshlets[]; };
+layout(binding = 1) readonly buffer MeshletVertices { uint meshlet_vertices[]; };
+layout(binding = 2) readonly buffer MeshletTriangles { uint8_t meshlet_triangles[]; };
+
+void main() {
+    Meshlet meshlet = meshlets[gl_WorkGroupID.x];
+    SetMeshOutputsEXT(meshlet.vertex_count, meshlet.triangle_count);
+
+    for (uint i = gl_LocalInvocationIndex; i < meshlet.vertex_count; i += gl_WorkGroupSize.x) {
+        uint index = meshlet_vertices[meshlet.vertex_offset + i];
+        gl_MeshVerticesEXT[i].gl_Position = world_view_projection * vec4(vertex_positions[index], 1);
+    }
+
+    for (uint i = gl_LocalInvocationIndex; i < meshlet.triangle_count; i += gl_WorkGroupSize.x) {
+        uint offset = meshlet.triangle_offset + i * 3;
+        gl_PrimitiveTriangleIndicesEXT[i] = uvec3(
+            meshlet_triangles[offset], meshlet_triangles[offset + 1], meshlet_triangles[offset + 2]);
+    }
+}
 ```
 
 After generating the meshlet data, it's also possible to generate extra data for each meshlet that can be saved and used at runtime to perform cluster culling, where each meshlet can be discarded if it's guaranteed to be invisible. To generate the data, `meshlet_computeMeshletBounds` can be used:
@@ -376,6 +450,61 @@ While the only way to get precise performance data is to measure performance on 
 `meshopt_analyzeOverdraw` returns overdraw statistics. The main metric it uses is overdraw - the ratio between the number of pixel shader invocations to the total number of covered pixels, as measured from several different orthographic cameras. The best case for overdraw is 1.0 - each pixel is shaded once.
 
 Note that all analyzers use approximate models for the relevant GPU units, so the numbers you will get as the result are only a rough approximation of the actual performance.
+
+## Specialized processing
+
+In addition to the core optimization techniques, the library provides several specialized algorithms for specific rendering techniques and pipeline optimizations that require a particular configuration of vertex and index data.
+
+### Geometry shader adjacency
+
+For algorithms that use geometry shaders and require adjacency information, this library can generate an index buffer with adjacency data:
+
+```c++
+std::vector<unsigned int> adjacency(indices.size() * 2);
+meshopt_generateAdjacencyIndexBuffer(&adjacency[0], &indices[0], indices.size(), &vertices[0].x, vertices.size(), sizeof(Vertex));
+```
+
+This creates an index buffer suitable for rendering with triangle-with-adjacency topology, providing 3 extra vertices per triangle that represent vertices opposite to each triangle's edge. This data can be used to compute silhouettes and perform other types of local geometric processing in geometry shaders. To render the mesh with adjacency data, the index buffer should be used with `D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ`/`VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY`/`GL_TRIANGLES_ADJACENCY` topology.
+
+Note that the use of geometry shaders may have a performance impact on some GPUs; in some cases alternative implementation strategies may be more efficient.
+
+### Tessellation with displacement mapping
+
+For hardware tessellation with crack-free displacement mapping, this library can generate a special index buffer that supports PN-AEN tessellation:
+
+```c++
+std::vector<unsigned int> tess(indices.size() * 4);
+meshopt_generateTessellationIndexBuffer(&tess[0], &indices[0], indices.size(), &vertices[0].x, vertices.size(), sizeof(Vertex));
+```
+
+This generates a 12-vertex patch for each input triangle with the following layout:
+
+- 0, 1, 2: original triangle vertices
+- 3, 4: opposing edge for edge 0, 1
+- 5, 6: opposing edge for edge 1, 2
+- 7, 8: opposing edge for edge 2, 0
+- 9, 10, 11: dominant vertices for corners 0, 1, 2
+
+This allows the use of hardware tessellation to implement PN-AEN and/or displacement mapping without cracks along UV seams or normal discontinuities. To render the mesh, the index buffer should be used with `D3D_PRIMITIVE_TOPOLOGY_12_CONTROL_POINT_PATCHLIST`/`VK_PRIMITIVE_TOPOLOGY_PATCH_LIST` (`patchControlPoints=12`) topology. For more details please refer to the following papers: [Crack-Free Point-Normal Triangles using Adjacent Edge Normals](https://developer.download.nvidia.com/whitepapers/2010/PN-AEN-Triangles-Whitepaper.pdf), [Tessellation on Any Budget](https://www.nvidia.com/content/pdf/gdc2011/john_mcdonald.pdf) and [My Tessellation Has Cracks!](https://developer.download.nvidia.com/assets/gamedev/files/gdc12/GDC12_DUDASH_MyTessellationHasCracks.pdf).
+
+### Visibility buffers
+
+To render geometry into visibility buffers, access to primitive index in fragment shader is required. While it is possible to use `SV_PrimitiveID`/`gl_PrimitiveID` in the fragment shader, this can result in suboptimal performance on some GPUs (notably, AMD RDNA1 and all NVidia GPUs), and may not be supported on mobile or console hardware. Using mesh shaders to generate primitive IDs is efficient but requires hardware support that is not universally available. To work around these limitations, this library provides a way to generate a special index buffer that uses provoking vertex to encode primitive IDs:
+
+```c++
+std::vector<unsigned int> provoke(indices.size());
+std::vector<unsigned int> reorder(vertices.size() + indices.size() / 3);
+reorder.resize(meshopt_generateProvokingIndexBuffer(&provoke[0], &reorder[0], &indices[0], indices.size(), vertices.size()));
+```
+
+This generates a special index buffer along with a reorder table that satisfies two constraints:
+
+- `provoke[3 * tri] == tri`
+- `reorder[provoke[x]]` refers to the original triangle vertices
+
+To render the mesh with provoking vertex data, the application should use `provoke` as an index buffer and a vertex shader that passes vertex index (`SV_VertexID`/`gl_VertexIndex`) via a `flat`/`nointerpolation` attribute to the fragment shader as a primitive index, and loads vertex data manually by computing the real vertex index based on `reorder` table (`reorder[gl_VertexIndex]`). For more details please refer to [Variable Rate Shading with Visibility Buffer Rendering](https://advances.realtimerendering.com/s2024/content/Hable/Advances_SIGGRAPH_2024_VisibilityVRS-SIGGRAPH_Advances_2024.pptx); naturally, this technique does not require VRS.
+
+Note: This assumes the provoking vertex is the first vertex of a triangle, which is true for all graphics APIs except OpenGL/WebGL. For OpenGL/WebGL, you may need to rotate each triangle (abc -> bca) in the resulting index buffer, or use the `glProvokingVertex` function (OpenGL 3.2+) or `WEBGL_provoking_vertex` extension (WebGL2) to change the provoking vertex convention. For WebGL2, this is highly recommended to avoid a variety of emulation slowdowns that happen by default if `flat` attributes are used, such as an implicit use of geometry shaders.
 
 ## Memory management
 
